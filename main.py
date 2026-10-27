@@ -1,5 +1,6 @@
 import os, ast, json, time, random, string, shutil, threading, subprocess, operator
-import urllib.request
+import urllib.request, signal, glob
+from kivy.core.clipboard import Clipboard
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
@@ -12,6 +13,7 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.screenmanager import ScreenManager, Screen
 
 Window.clearcolor = (0.05, 0.05, 0.08, 1)
+Window.softinput_mode = "resize"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("ANDROID_PRIVATE") or os.path.expanduser("~")
 STORE = "/storage/emulated/0"
@@ -53,30 +55,60 @@ def jsave(name, obj):
 # ---------------- Console widget ----------------
 class Console(BoxLayout):
     def __init__(self, handler, banner, **kw):
-        super().__init__(orientation="vertical", spacing=dp(4), **kw)
+        super().__init__(orientation="vertical", spacing=dp(3), **kw)
         self.handler, self.hist, self.i = handler, [], 0
-        self.lines = [fx(banner)]
+        self.lines, self.raw, self.pend = [fx(banner)], [banner], []
+        self.sched = False
+        self.ctrl = self.alt = False
+        self.buf, self.mark, self.last = None, "", ""
+        self._skip = False
+
         self.out = Label(text="\n".join(self.lines), markup=True,
-                         size_hint_y=None, halign="left",
-                         valign="top", color=(.6, 1, .6, 1),
-                         font_size=dp(14), **FK)
+                         size_hint_y=None, halign="left", valign="top",
+                         color=(.6, 1, .6, 1), font_size=dp(14))
         self.out.bind(width=lambda w, v: setattr(w, "text_size", (v, None)),
                       texture_size=lambda w, s: setattr(w, "height", s[1]))
         self.sv = ScrollView()
         self.sv.add_widget(self.out)
         self.add_widget(self.sv)
+
         self.prev = Label(text="", markup=True, size_hint_y=None,
                           height=dp(28), halign="left", valign="middle",
                           color=(1, 1, 1, 1), font_size=dp(16))
         self.prev.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
         self.add_widget(self.prev)
+
+        keys = [("Esc", self.k_esc), ("Tab", self.k_tab),
+                ("Ctrl", self.k_ctrl), ("Alt", self.k_alt),
+                ("Home", lambda *_: self.mv("cursor_home")),
+                ("End", lambda *_: self.mv("cursor_end")),
+                ("<-", lambda *_: self.mv("cursor_left")),
+                ("->", lambda *_: self.mv("cursor_right")),
+                ("Paste", self.k_paste), ("Copy", self.k_copy),
+                ("^C", self.k_int), ("Clear", self.k_clear)]
+        krow = BoxLayout(size_hint_x=None, width=len(keys) * dp(68),
+                         spacing=dp(3))
+        self.kb = {}
+        for name, cb in keys:
+            b = Button(text=name, size_hint_x=None, width=dp(66),
+                       font_size=dp(14))
+            b.bind(on_release=cb)
+            krow.add_widget(b)
+            self.kb[name] = b
+        ks = ScrollView(size_hint_y=None, height=dp(42),
+                        do_scroll_x=True, do_scroll_y=False)
+        ks.add_widget(krow)
+        self.add_widget(ks)
+
         row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(4))
         self.inp = TextInput(multiline=False, font_size=dp(16),
+                             write_tab=False, use_bubble=True,
+                             use_handles=True,
                              background_color=(.12, .12, .16, 1),
                              foreground_color=((0, 0, 0, 0) if ETHI else (1, 1, 1, 1)),
-                             cursor_color=(1, 1, 1, 1), **FK)
+                             cursor_color=(1, 1, 1, 1))
         self.inp.bind(on_text_validate=self.submit)
-        self.inp.bind(text=lambda i, v: setattr(self.prev, "text", fx(v)))
+        self.inp.bind(text=self.on_text)
         row.add_widget(self.inp)
         for t, d in (("Up", -1), ("Dn", 1)):
             b = Button(text=t, size_hint_x=None, width=dp(48))
@@ -84,20 +116,144 @@ class Console(BoxLayout):
             row.add_widget(b)
         self.add_widget(row)
 
+    # ---------- ውጤት ----------
     def write(self, t):
-        def f(dt):
-            self.lines = (self.lines + [fx(t)])[-300:]
-            self.out.text = "\n".join(self.lines)
-            self.sv.scroll_y = 0
-        Clock.schedule_once(f)
+        self.pend.append((str(t), fx(t)))
+        if not self.sched:
+            self.sched = True
+            Clock.schedule_once(self.flush, 0.1)
+
+    def flush(self, dt):
+        self.sched = False
+        p, self.pend = self.pend, []
+        self.raw = (self.raw + [a for a, b in p])[-300:]
+        self.lines = (self.lines + [b for a, b in p])[-300:]
+        self.out.text = "\n".join(self.lines)
+        self.sv.scroll_y = 0
+
+    # ---------- ቁልፎች ----------
+    def mv(self, action, ctl=False):
+        self.inp.do_cursor_movement(action, control=ctl)
+        self.inp.focus = True
+
+    def paint(self):
+        for n, on in (("Ctrl", self.ctrl), ("Alt", self.alt)):
+            self.kb[n].background_color = (.3, .8, .3, 1) if on else (1, 1, 1, 1)
+
+    def k_esc(self, *_):
+        self.buf = None
+        self.inp.text = ""
+
+    def k_ctrl(self, *_):
+        self.ctrl = not self.ctrl
+        self.alt = False
+        self.paint()
+
+    def k_alt(self, *_):
+        self.alt = not self.alt
+        self.ctrl = False
+        self.paint()
+
+    def k_tab(self, *_):
+        if self.buf:
+            return
+        t = self.inp.text
+        tok = t.split(" ")[-1]
+        base = getattr(self.handler, "cwd", START)
+        ms = sorted(glob.glob(os.path.join(base, os.path.expanduser(tok)) + "*"))
+        if not ms:
+            return
+        names = []
+        for p in ms:
+            rel = p if tok.startswith(("/", "~")) else os.path.relpath(p, base)
+            names.append(rel + ("/" if os.path.isdir(p) else ""))
+        if len(names) == 1:
+            new = names[0]
+        else:
+            new = os.path.commonprefix(names)
+            self.write("  ".join(names[:30]))
+        self.inp.text = t[:len(t) - len(tok)] + new
+        self.mv("cursor_end")
+
+    def k_paste(self, *_):
+        t = (Clipboard.paste() or "").replace("\r", "").strip("\n")
+        if not t:
+            return
+        if "\n" in t:
+            self.buf = t
+            self.mark = "[ተለጠፈ %d መስመሮች - Enter ለማስኬድ]" % (t.count("\n") + 1)
+            self.inp.text = self.mark
+        else:
+            self.inp.insert_text(t)
+        self.inp.focus = True
+
+    def k_copy(self, *_):
+        Clipboard.copy("\n".join(self.raw)[-20000:])
+        self.write("(ተቀድቷል)")
+
+    def k_int(self, *_):
+        f = getattr(self.handler, "interrupt", None)
+        if f:
+            f()
+        self.write("^C")
+
+    def k_clear(self, *_):
+        self.lines, self.raw, self.pend = [], [], []
+        self.out.text = ""
 
     def recall(self, d):
         if self.hist:
             self.i = max(0, min(len(self.hist) - 1, self.i + d))
             self.inp.text = self.hist[self.i]
 
+    def upd_prev(self, dt):
+        self.prev.text = fx(self.inp.text)
+
+    def combo(self, c, ctrl):
+        i = self.inp
+        if ctrl:
+            if c == "c":
+                self.k_int()
+            elif c == "l":
+                self.k_clear()
+            elif c == "a":
+                self.mv("cursor_home")
+            elif c == "e":
+                self.mv("cursor_end")
+            elif c == "u":
+                i.text = ""
+            elif c == "k":
+                i.text = i.text[:i.cursor_col]
+            elif c == "w":
+                s = i.text.rstrip()
+                i.text = (s.rsplit(" ", 1)[0] + " ") if " " in s else ""
+        else:
+            if c == "b":
+                self.mv("cursor_left", True)
+            elif c == "f":
+                self.mv("cursor_right", True)
+
+    def on_text(self, inst, v):
+        if self._skip:
+            self._skip = False
+            return
+        if self.buf and v != self.mark:
+            self.buf = None
+        if (self.ctrl or self.alt) and len(v) == len(self.last) + 1:
+            c, ctrl = v[-1].lower(), self.ctrl
+            self.ctrl = self.alt = False
+            self.paint()
+            self._skip = True
+            self.inp.text = self.last
+            self.combo(c, ctrl)
+            return
+        self.last = v
+        Clock.unschedule(self.upd_prev)
+        Clock.schedule_once(self.upd_prev, 0.12)
+
     def submit(self, *_):
-        line = self.inp.text.strip()
+        line = self.buf if self.buf else self.inp.text.strip()
+        self.buf = None
         self.inp.text = ""
         Clock.schedule_once(lambda dt: setattr(self.inp, "focus", True), 0.1)
         if not line:
@@ -106,8 +262,7 @@ class Console(BoxLayout):
         self.i = len(self.hist)
         self.write("› " + line)
         if line in ("አጽዳ", "clear"):
-            self.lines = []
-            self.out.text = ""
+            self.k_clear()
             return
         def job():
             try:
@@ -116,25 +271,41 @@ class Console(BoxLayout):
                 self.write("ERR " + str(e))
         threading.Thread(target=job, daemon=True).start()
 
-# ---------------- ተርሚናል ----------------
 class Term:
     def __init__(self):
         self.cwd = START
+        self.proc = None
+
+    def interrupt(self):
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except Exception:
+                p.terminate()
+
     def __call__(self, line, w):
-        if line == "ወዴት":
+        one = "\n" not in line
+        if one and line == "ወዴት":
             return w(self.cwd)
-        if line.split()[0] == "cd":
+        if one and line.split()[0] == "cd":
             p = os.path.expanduser(line[2:].strip() or "~")
             p = os.path.abspath(os.path.join(self.cwd, p))
             if os.path.isdir(p):
                 self.cwd = p
                 return w(p)
             return w("ERR አቃፊ አልተገኘም")
-        r = subprocess.run(line, shell=True, cwd=self.cwd, capture_output=True,
-                           text=True, timeout=120)
-        w((r.stdout + r.stderr).rstrip()[:6000] or "(ባዶ)")
+        p = subprocess.Popen(line, shell=True, cwd=self.cwd,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, text=True,
+                             bufsize=1, start_new_session=True)
+        self.proc = p
+        for ln in p.stdout:
+            w(ln.rstrip("\n"))
+        p.wait()
+        self.proc = None
 
-# ---------------- ፋይሎች ----------------
 class Files:
     def __init__(self):
         self.cwd = START
