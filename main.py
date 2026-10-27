@@ -17,12 +17,21 @@ DATA = os.environ.get("ANDROID_PRIVATE") or os.path.expanduser("~")
 STORE = "/storage/emulated/0"
 START = STORE if os.path.isdir(STORE) else DATA
 
-FONT = next((f for f in [
-    os.path.join(HERE, "NotoSansEthiopic-Regular.ttf"),
+from kivy.core.text import LabelBase
+from kivy.utils import escape_markup
+import re
+ETHI = next((f for f in [
+    os.path.join(HERE, "ethi.ttf"),
+    "/system/fonts/NotoSansEthiopic-VF.ttf",
     "/system/fonts/NotoSansEthiopic-Regular.otf",
-    "/system/fonts/NotoSansEthiopic-Regular.ttf",
-    "/system/fonts/NotoSerifEthiopic-Regular.otf"] if os.path.exists(f)), None)
-FK = {"font_name": FONT} if FONT else {}
+    "/system/fonts/NotoSansEthiopic-Regular.ttf"] if os.path.exists(f)), None)
+if ETHI:
+    LabelBase.register(name="ethi", fn_regular=ETHI)
+_ER = re.compile("([\u1200-\u139f\u2d80-\u2ddf\uab00-\uab2f]+)")
+def fx(t):
+    t = escape_markup(str(t))
+    return _ER.sub(r"[font=ethi]\1[/font]", t) if ETHI else t
+FK = {}
 
 try:
     from android.permissions import request_permissions, Permission
@@ -41,11 +50,14 @@ def jsave(name, obj):
     json.dump(obj, open(os.path.join(DATA, name), "w", encoding="utf-8"),
               ensure_ascii=False)
 
+# ---------------- Console widget ----------------
 class Console(BoxLayout):
     def __init__(self, handler, banner, **kw):
         super().__init__(orientation="vertical", spacing=dp(4), **kw)
         self.handler, self.hist, self.i = handler, [], 0
-        self.out = Label(text=banner + "\n", size_hint_y=None, halign="left",
+        self.lines = [fx(banner)]
+        self.out = Label(text="\n".join(self.lines), markup=True,
+                         size_hint_y=None, halign="left",
                          valign="top", color=(.6, 1, .6, 1),
                          font_size=dp(14), **FK)
         self.out.bind(width=lambda w, v: setattr(w, "text_size", (v, None)),
@@ -53,13 +65,20 @@ class Console(BoxLayout):
         self.sv = ScrollView()
         self.sv.add_widget(self.out)
         self.add_widget(self.sv)
+        self.prev = Label(text="", markup=True, size_hint_y=None,
+                          height=dp(28), halign="left", valign="middle",
+                          color=(1, 1, 1, 1), font_size=dp(16))
+        self.prev.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        self.add_widget(self.prev)
         row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(4))
         self.inp = TextInput(multiline=False, font_size=dp(16),
                              background_color=(.12, .12, .16, 1),
-                             foreground_color=(1, 1, 1, 1), **FK)
+                             foreground_color=((0, 0, 0, 0) if ETHI else (1, 1, 1, 1)),
+                             cursor_color=(1, 1, 1, 1), **FK)
         self.inp.bind(on_text_validate=self.submit)
+        self.inp.bind(text=lambda i, v: setattr(self.prev, "text", fx(v)))
         row.add_widget(self.inp)
-        for t, d in (("↑", -1), ("↓", 1)):
+        for t, d in (("Up", -1), ("Dn", 1)):
             b = Button(text=t, size_hint_x=None, width=dp(48))
             b.bind(on_release=lambda _b, d=d: self.recall(d))
             row.add_widget(b)
@@ -67,7 +86,8 @@ class Console(BoxLayout):
 
     def write(self, t):
         def f(dt):
-            self.out.text = (self.out.text + str(t) + "\n")[-20000:]
+            self.lines = (self.lines + [fx(t)])[-300:]
+            self.out.text = "\n".join(self.lines)
             self.sv.scroll_y = 0
         Clock.schedule_once(f)
 
@@ -86,15 +106,17 @@ class Console(BoxLayout):
         self.i = len(self.hist)
         self.write("› " + line)
         if line in ("አጽዳ", "clear"):
+            self.lines = []
             self.out.text = ""
             return
         def job():
             try:
                 self.handler(line, self.write)
             except Exception as e:
-                self.write("❌ " + str(e))
+                self.write("ERR " + str(e))
         threading.Thread(target=job, daemon=True).start()
 
+# ---------------- ተርሚናል ----------------
 class Term:
     def __init__(self):
         self.cwd = START
@@ -107,11 +129,12 @@ class Term:
             if os.path.isdir(p):
                 self.cwd = p
                 return w(p)
-            return w("❌ አቃፊ አልተገኘም")
+            return w("ERR አቃፊ አልተገኘም")
         r = subprocess.run(line, shell=True, cwd=self.cwd, capture_output=True,
                            text=True, timeout=120)
         w((r.stdout + r.stderr).rstrip()[:6000] or "(ባዶ)")
 
+# ---------------- ፋይሎች ----------------
 class Files:
     def __init__(self):
         self.cwd = START
@@ -125,34 +148,34 @@ class Files:
             if os.path.isdir(p):
                 self.cwd = p
                 return w(p)
-            return w("❌ አቃፊ የለም")
+            return w("ERR አቃፊ የለም")
         if c == "ፋይሎች":
             p = self.p(r[0]) if r else self.cwd
             for n in sorted(os.listdir(p)):
                 f = os.path.join(p, n)
-                w(("📁 " + n + "/") if os.path.isdir(f)
-                  else "📄 %s  %.1fKB" % (n, os.path.getsize(f) / 1024))
+                w(("[D] " + n + "/") if os.path.isdir(f)
+                  else "[F] %s  %.1fKB" % (n, os.path.getsize(f) / 1024))
         elif c == "አንብብ" and r:
             w(open(self.p(r[0]), encoding="utf-8", errors="ignore").read()[:5000])
         elif c == "ቅዳ" and len(r) == 2:
             s, d = self.p(r[0]), self.p(r[1])
             shutil.copytree(s, d) if os.path.isdir(s) else shutil.copy2(s, d)
-            w("✅")
+            w("OK")
         elif c == "አንቀሳቅስ" and len(r) == 2:
             shutil.move(self.p(r[0]), self.p(r[1]))
-            w("✅")
+            w("OK")
         elif c == "ሰርዝ" and r:
             if r[-1] != "አዎ":
-                return w("⚠️ ለማረጋገጥ መጨረሻ ላይ 'አዎ' ጨምር: ሰርዝ ፋይል አዎ")
+                return w("! ለማረጋገጥ መጨረሻ ላይ 'አዎ' ጨምር: ሰርዝ ፋይል አዎ")
             p = self.p(r[0])
             shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
-            w("✅ ተሰርዟል")
+            w("OK ተሰርዟል")
         elif c == "አቃፊ" and r:
             os.makedirs(self.p(r[0]), exist_ok=True)
-            w("✅")
+            w("OK")
         elif c == "ጻፍ" and len(r) >= 2:
             open(self.p(r[0]), "w", encoding="utf-8").write(" ".join(r[1:]))
-            w("✅ ተጽፏል")
+            w("OK ተጽፏል")
         elif c == "ፈልግ" and r:
             n = 0
             for d, _, fs in os.walk(self.cwd):
@@ -166,6 +189,7 @@ class Files:
         else:
             w("ትዕዛዞች: cd ፋይሎች አንብብ ቅዳ አንቀሳቅስ ሰርዝ አቃፊ ጻፍ ፈልግ")
 
+# ---------------- AI (Gemini ነጻ ቁልፍ) ----------------
 class AI:
     def __init__(self):
         self.model = jload("ai.json", {}).get("model", "gemini-2.0-flash")
@@ -177,14 +201,14 @@ class AI:
         if line.startswith("ቁልፍ "):
             self.key = line[5:].strip()
             self.save()
-            return w("✅ ቁልፍ ተቀምጧል")
+            return w("OK ቁልፍ ተቀምጧል")
         if line.startswith("ሞዴል "):
             self.model = line[5:].strip()
             self.save()
-            return w("✅ " + self.model)
+            return w("OK " + self.model)
         if line == "አዲስ":
             self.h = []
-            return w("✅ አዲስ ውይይት")
+            return w("OK አዲስ ውይይት")
         if not self.key:
             return w("መጀመሪያ ነጻ ቁልፍ ከ aistudio.google.com አውጥተህ:\nቁልፍ <ቁልፍህ>")
         self.h.append({"role": "user", "parts": [{"text": line}]})
@@ -200,8 +224,9 @@ class AI:
             d = json.loads(r.read().decode())
         t = d["candidates"][0]["content"]["parts"][0]["text"].strip()
         self.h.append({"role": "model", "parts": [{"text": t}]})
-        w("🤖 " + t)
+        w("AI: " + t)
 
+# ---------------- ስራ / መሳሪያዎች ----------------
 OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
        ast.Div: operator.truediv, ast.Pow: operator.pow, ast.USub: operator.neg,
        ast.Mod: operator.mod}
@@ -233,7 +258,7 @@ def Tools(line, w):
         if r:
             L.append(r)
             jsave("notes.json", L)
-            w("✅")
+            w("OK")
         else:
             w("\n".join("%d. %s" % (i + 1, x) for i, x in enumerate(L)) or "ባዶ")
     elif c == "ስራ":
@@ -242,21 +267,22 @@ def Tools(line, w):
         if s and s[0] == "ጨምር" and len(s) > 1:
             T.append({"t": s[1], "d": False})
             jsave("todo.json", T)
-            w("✅")
+            w("OK")
         elif s and s[0] == "ጨርስ" and len(s) > 1 and s[1].isdigit():
             T[int(s[1]) - 1]["d"] = True
             jsave("todo.json", T)
-            w("✅")
+            w("OK")
         elif s and s[0] == "ሰርዝ" and len(s) > 1 and s[1].isdigit():
             T.pop(int(s[1]) - 1)
             jsave("todo.json", T)
-            w("✅")
+            w("OK")
         else:
             w("\n".join("%d. [%s] %s" % (i + 1, "x" if x["d"] else " ", x["t"])
                         for i, x in enumerate(T)) or "ምንም ስራ የለም")
     else:
         w("ሒሳብ 2+3*4 · ሰዓት · ይለፍ 16 · ማስታወሻ ጽሑፍ · ስራ ጨምር/ጨርስ/ሰርዝ ቁጥር")
 
+# ---------------- መተግበሪያ ----------------
 class HabibShell(App):
     def build(self):
         self.title = "HABIB SHELL"
@@ -271,7 +297,7 @@ class HabibShell(App):
             s = Screen(name=name)
             s.add_widget(Console(h, "HABIB SHELL — " + label + "\n" + banner))
             sm.add_widget(s)
-            b = Button(text=label, **FK)
+            b = Button(text=fx(label), markup=True)
             b.bind(on_release=lambda _b, n=name: setattr(sm, "current", n))
             bar.add_widget(b)
         root.add_widget(bar)
