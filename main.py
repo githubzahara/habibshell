@@ -12,7 +12,12 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.screenmanager import ScreenManager, Screen
 
-Window.clearcolor = (0.05, 0.05, 0.08, 1)
+BG = (0.04, 0.05, 0.09, 1)
+PANEL = (0.09, 0.11, 0.17, 1)
+KEYBG = (0.14, 0.17, 0.26, 1)
+ACC = (0.25, 0.65, 1, 1)
+OKC = (0.2, 0.75, 0.45, 1)
+Window.clearcolor = BG
 Window.softinput_mode = "resize"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("ANDROID_PRIVATE") or os.path.expanduser("~")
@@ -54,9 +59,12 @@ def jsave(name, obj):
 
 # ---------------- Console widget ----------------
 class Console(BoxLayout):
-    def __init__(self, handler, banner, **kw):
+    def __init__(self, handler, banner, name=None, **kw):
         super().__init__(orientation="vertical", spacing=dp(3), **kw)
-        self.handler, self.hist, self.i = handler, [], 0
+        self.handler = handler
+        self.name = name
+        self.hist = jload("h_%s.json" % name, [])[-200:] if name else []
+        self.i = len(self.hist)
         self.lines, self.raw, self.pend = [fx(banner)], [banner], []
         self.sched = False
         self.ctrl = self.alt = False
@@ -91,7 +99,8 @@ class Console(BoxLayout):
         self.kb = {}
         for name, cb in keys:
             b = Button(text=name, size_hint_x=None, width=dp(66),
-                       font_size=dp(14))
+                       font_size=dp(14), background_normal="",
+                       background_color=KEYBG)
             b.bind(on_release=cb)
             krow.add_widget(b)
             self.kb[name] = b
@@ -104,14 +113,15 @@ class Console(BoxLayout):
         self.inp = TextInput(multiline=False, font_size=dp(16),
                              write_tab=False, use_bubble=True,
                              use_handles=True,
-                             background_color=(.12, .12, .16, 1),
+                             background_color=PANEL,
                              foreground_color=((0, 0, 0, 0) if ETHI else (1, 1, 1, 1)),
                              cursor_color=(1, 1, 1, 1))
         self.inp.bind(on_text_validate=self.submit)
         self.inp.bind(text=self.on_text)
         row.add_widget(self.inp)
         for t, d in (("Up", -1), ("Dn", 1)):
-            b = Button(text=t, size_hint_x=None, width=dp(48))
+            b = Button(text=t, size_hint_x=None, width=dp(48),
+                       background_normal="", background_color=ACC)
             b.bind(on_release=lambda _b, d=d: self.recall(d))
             row.add_widget(b)
         self.add_widget(row)
@@ -138,7 +148,7 @@ class Console(BoxLayout):
 
     def paint(self):
         for n, on in (("Ctrl", self.ctrl), ("Alt", self.alt)):
-            self.kb[n].background_color = (.3, .8, .3, 1) if on else (1, 1, 1, 1)
+            self.kb[n].background_color = OKC if on else KEYBG
 
     def k_esc(self, *_):
         self.buf = None
@@ -258,7 +268,10 @@ class Console(BoxLayout):
         Clock.schedule_once(lambda dt: setattr(self.inp, "focus", True), 0.1)
         if not line:
             return
-        self.hist.append(line)
+        if "\n" not in line:
+            self.hist.append(line)
+            if self.name:
+                jsave("h_%s.json" % self.name, self.hist[-200:])
         self.i = len(self.hist)
         self.write("› " + line)
         if line in ("አጽዳ", "clear"):
@@ -271,10 +284,47 @@ class Console(BoxLayout):
                 self.write("ERR " + str(e))
         threading.Thread(target=job, daemon=True).start()
 
+TERM_HELP = """HABIB SHELL v2
+help / እርዳታ    ይህ ዝርዝር
+py <ኮድ>        Python ማስኬጃ (py 2+3 · py import os; print(os.getcwd()))
+get <url>       ድረ-ገጽ ማውረድ (ጽሑፍ)
+edit <ፋይል>      በኤዲተር ትር ክፈት
+cd · ወዴት        አቃፊ
+ሌላ ማንኛውም sh ትዕዛዝ (ls, cat, cp, mv, rm, ping ...)
+ብዙ መስመር: Paste ተጫንና Enter"""
+
 class Term:
     def __init__(self):
         self.cwd = START
         self.proc = None
+        self.ns = {}
+
+    def run_py(self, code, w):
+        import io, contextlib, traceback
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                try:
+                    r = eval(compile(code, "<py>", "eval"), self.ns)
+                    if r is not None:
+                        print(repr(r))
+                except SyntaxError:
+                    exec(compile(code, "<py>", "exec"), self.ns)
+        except Exception:
+            buf.write(traceback.format_exc(limit=1))
+        w(buf.getvalue().rstrip() or "(ባዶ)")
+
+    def http_get(self, url, w):
+        if not url.startswith("http"):
+            url = "https://" + url
+        req = urllib.request.Request(url, headers={"User-Agent": "HabibShell/2"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            w(r.read(4000).decode("utf-8", "ignore"))
+
+    def edit(self, path):
+        p = os.path.abspath(os.path.join(self.cwd, os.path.expanduser(path)))
+        app = App.get_running_app()
+        Clock.schedule_once(lambda dt: app.open_editor(p))
 
     def interrupt(self):
         p = self.proc
@@ -295,6 +345,17 @@ class Term:
                 self.cwd = p
                 return w(p)
             return w("ERR አቃፊ አልተገኘም")
+        if one:
+            parts = line.split(None, 1)
+            arg = parts[1] if len(parts) > 1 else ""
+            if parts[0] in ("help", "እርዳታ"):
+                return w(TERM_HELP)
+            if parts[0] == "py" and arg:
+                return self.run_py(arg, w)
+            if parts[0] == "get" and arg:
+                return self.http_get(arg, w)
+            if parts[0] == "edit" and arg:
+                return self.edit(arg)
         p = subprocess.Popen(line, shell=True, cwd=self.cwd,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT,
@@ -453,26 +514,101 @@ def Tools(line, w):
     else:
         w("ሒሳብ 2+3*4 · ሰዓት · ይለፍ 16 · ማስታወሻ ጽሑፍ · ስራ ጨምር/ጨርስ/ሰርዝ ቁጥር")
 
+# ---------------- ኤዲተር ----------------
+class Editor(BoxLayout):
+    def __init__(self, **kw):
+        super().__init__(orientation="vertical", spacing=dp(4), **kw)
+        self.path = TextInput(multiline=False, size_hint_y=None, height=dp(44),
+                              font_size=dp(15), background_color=PANEL,
+                              foreground_color=(1, 1, 1, 1),
+                              cursor_color=(1, 1, 1, 1),
+                              text=os.path.join(START, "note.txt"))
+        self.add_widget(self.path)
+        bar = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(4))
+        for t, cb in (("Open", self.open), ("Save", self.save), ("New", self.new)):
+            b = Button(text=t, background_normal="",
+                       background_color=ACC if t == "Save" else KEYBG)
+            b.bind(on_release=cb)
+            bar.add_widget(b)
+        self.add_widget(bar)
+        self.msg = Label(text="", size_hint_y=None, height=dp(24),
+                         color=(.6, 1, .6, 1), font_size=dp(13), markup=True,
+                         halign="left")
+        self.msg.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        self.add_widget(self.msg)
+        self.ed = TextInput(multiline=True, font_size=dp(14),
+                            background_color=(.07, .09, .14, 1),
+                            foreground_color=(.9, .95, 1, 1),
+                            cursor_color=(1, 1, 1, 1), use_bubble=True,
+                            use_handles=True)
+        self.add_widget(self.ed)
+
+    def say(self, t):
+        self.msg.text = fx(t)
+
+    def open(self, *_):
+        p = os.path.expanduser(self.path.text.strip())
+        try:
+            self.ed.text = open(p, encoding="utf-8", errors="ignore").read()
+            self.say("OK ተከፍቷል: " + p)
+        except Exception as e:
+            self.say("ERR " + str(e))
+
+    def save(self, *_):
+        p = os.path.expanduser(self.path.text.strip())
+        try:
+            open(p, "w", encoding="utf-8").write(self.ed.text)
+            self.say("OK ተቀምጧል: " + p)
+        except Exception as e:
+            self.say("ERR " + str(e))
+
+    def new(self, *_):
+        self.ed.text = ""
+        self.say("አዲስ ፋይል")
+
 # ---------------- መተግበሪያ ----------------
 class HabibShell(App):
     def build(self):
         self.title = "HABIB SHELL"
-        root = BoxLayout(orientation="vertical")
-        sm = ScreenManager()
-        tabs = [("ተርሚናል", "term", Term(), "ማንኛውም sh ትዕዛዝ ይሰራል (ls, cat, python...)"),
-                ("ፋይሎች", "files", Files(), "ትዕዛዞች: ፋይሎች አንብብ ቅዳ አንቀሳቅስ ሰርዝ ፈልግ"),
+        root = BoxLayout(orientation="vertical", padding=dp(2), spacing=dp(2))
+        self.sm = ScreenManager()
+        self.tabs = {}
+        defs = [("ተርሚናል", "term", Term(), "sh · py ኮድ · get url · edit ፋይል · help"),
+                ("ፋይሎች", "files", Files(), "ፋይሎች አንብብ ቅዳ አንቀሳቅስ ሰርዝ ፈልግ"),
                 ("AI", "ai", AI(), "ቁልፍ <ቁልፍ> ብለህ አስገባ · አዲስ · ሞዴል <ስም>"),
                 ("ስራ", "tools", Tools, "ሒሳብ · ሰዓት · ይለፍ · ማስታወሻ · ስራ")]
-        bar = BoxLayout(size_hint_y=None, height=dp(46))
-        for label, name, h, banner in tabs:
+        bar = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(3))
+        for label, name, h, banner in defs:
             s = Screen(name=name)
-            s.add_widget(Console(h, "HABIB SHELL — " + label + "\n" + banner))
-            sm.add_widget(s)
-            b = Button(text=fx(label), markup=True)
-            b.bind(on_release=lambda _b, n=name: setattr(sm, "current", n))
-            bar.add_widget(b)
+            s.add_widget(Console(h, "HABIB SHELL — " + label + "\n" + banner,
+                                 name=name))
+            self.sm.add_widget(s)
+            self.add_tab(bar, label, name)
+        s = Screen(name="edit")
+        self.editor = Editor()
+        s.add_widget(self.editor)
+        self.sm.add_widget(s)
+        self.add_tab(bar, "ኤዲተር", "edit")
         root.add_widget(bar)
-        root.add_widget(sm)
+        root.add_widget(self.sm)
+        self.select("term")
         return root
+
+    def add_tab(self, bar, label, name):
+        b = Button(text=fx(label), markup=True, background_normal="",
+                   background_color=KEYBG)
+        b.bind(on_release=lambda _b, n=name: self.select(n))
+        bar.add_widget(b)
+        self.tabs[name] = b
+
+    def select(self, n):
+        self.sm.current = n
+        for k, b in self.tabs.items():
+            b.background_color = ACC if k == n else KEYBG
+
+    def open_editor(self, path):
+        self.editor.path.text = path
+        self.editor.open()
+        self.select("edit")
 
 HabibShell().run()
