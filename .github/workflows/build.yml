@@ -31,10 +31,19 @@ jobs:
             .buildozer
           key: buildozer-${{ hashFiles('buildozer.spec') }}
       - name: Build APK
+        run: buildozer -v android debug
+      - name: Sign APK
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.KS_PASS }}
         run: |
-          echo "JAVA_HOME=$JAVA_HOME"
-          java -version
-          buildozer -v android debug
+          if [ -z "$KS_B64" ]; then echo "no keystore secret, keeping debug signature"; exit 0; fi
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/habib.keystore"
+          AS=$(ls -d ~/.buildozer/android/platform/android-sdk/build-tools/*/ | sort -V | tail -1)apksigner
+          for f in bin/*.apk; do
+            "$AS" sign --ks "$RUNNER_TEMP/habib.keystore" --ks-key-alias habib --ks-pass env:KS_PASS --key-pass env:KS_PASS "$f"
+            "$AS" verify --print-certs "$f" | head -3
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: habibshell-apk
